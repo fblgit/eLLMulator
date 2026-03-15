@@ -96,32 +96,68 @@ function getMcpConfig(intPort?: number): { mcpServers?: Record<string, any>; rev
 // ---------------------------------------------------------------------------
 
 /**
- * Lazy-spawn a fresh agent session for a ready registry entry whose session
- * is missing (null session_id or stale session from a dead process).
+ * Revive a session for a ready registry entry whose session is missing from
+ * the in-memory SessionManager.
  *
- * This enables the `trace` CLI cold-start path: registry is loaded from
- * persistence with ready entries, but SessionManager is fresh (no sessions).
+ * Two paths:
  *
- * Returns the new session_id. Throws SESSION_NOT_AVAILABLE on failure.
+ * 1. **Rehydrate** (entry.session_id exists): The SDK transcript is on disk
+ *    at ~/.claude/projects/.  We register the session_id in the in-memory Map
+ *    so invokeOnSession() can `resume + forkSession` from the original
+ *    bootstrap conversation — zero API calls.
+ *
+ * 2. **Create fresh** (entry.session_id is null — persistence gap): The
+ *    bootstrap session_id was never persisted.  We must create a new session
+ *    via the SDK.  If declarations exist, use a lightweight "ready" prompt;
+ *    otherwise do a full bootstrap.
+ *
+ * Returns the session_id. Throws SESSION_NOT_AVAILABLE on failure.
  */
 async function reviveSession(
   target: string,
-  entry: { file_hash: string; session_id: string | null },
+  entry: { file_hash: string; session_id: string | null; declarations?: unknown },
   deps: InvokeDeps,
 ): Promise<string> {
-  // Check if the entry already has declarations from persistence.
-  // If so, skip full bootstrap (reading imports, calling register) — just
-  // create a minimal session. Full bootstrap only needed for cold entries.
-  const hasDeclarations = !!(entry as any).declarations;
+  const hasDeclarations = !!entry.declarations;
   log.info('reviveSession starting', { target, oldSessionId: entry.session_id ?? 'null', fileHash: entry.file_hash, hasDeclarations });
+
+  // --- Path 1: Rehydrate (session transcript exists on disk) ---------------
+  if (entry.session_id) {
+    try {
+      const systemPrompt = renderSystemPrompt({
+        filePath: target,
+        sourceCode: '',
+      });
+      const mcpConfig = getMcpConfig(deps.intPort);
+
+      deps.sessionManager.rehydrate({
+        sessionId: entry.session_id,
+        filePath: target,
+        fileHash: entry.file_hash,
+        systemPrompt,
+        tools: mcpConfig.revivalTools,
+        model: deps.model ?? 'claude-sonnet-4-6',
+      });
+
+      log.info('reviveSession rehydrated (no API call)', { target, sessionId: entry.session_id });
+      return entry.session_id;
+    } catch (rehydrateErr) {
+      // Rehydrate is in-memory only — failures are unexpected but non-fatal.
+      // Fall through to the create path.
+      log.warn('rehydrate failed, falling back to create', {
+        target,
+        error: rehydrateErr instanceof Error ? rehydrateErr.message : String(rehydrateErr),
+      });
+    }
+  }
+
+  // --- Path 2: Create fresh (no session_id or rehydrate failed) ------------
   try {
     const systemPrompt = renderSystemPrompt({
       filePath: target,
-      sourceCode: '',  // source is read by agent via cat -n, not embedded
+      sourceCode: '',
     });
 
-    // Warm revival: declarations exist, just need a live session.
-    // Cold revival: no declarations, needs full bootstrap.
     const bootstrapPrompt = hasDeclarations
       ? 'Your declarations are already registered from a previous session. You are ready for trace tasks. Respond with "ready" and wait for your next message.'
       : renderBootstrapPrompt({ filePath: target });
@@ -134,16 +170,13 @@ async function reviveSession(
       bootstrapPrompt,
       tools: mcpConfig.revivalTools,
       ...(mcpConfig.mcpServers && { mcpServers: mcpConfig.mcpServers }),
-      // Revival = bootstrap: allow Bash (for cat -n), Grep, Glob, LS.
-      // Block Agent/Task (delegation), Write/Edit (no modifications), and Read (use cat -n instead).
       disallowedTools: ['Agent', 'Task', 'Write', 'Edit', 'Read'],
       model: deps.model ?? 'claude-sonnet-4-6',
       cwd: deps.projectDir,
     });
 
-    // Update registry with the revived session_id
     deps.registry.update(target, { session_id: session.session_id });
-    log.info('reviveSession succeeded', { target, newSessionId: session.session_id });
+    log.info('reviveSession created fresh', { target, newSessionId: session.session_id });
     return session.session_id;
   } catch (revivalErr) {
     const revivalMsg = revivalErr instanceof Error ? revivalErr.message : String(revivalErr);
@@ -444,16 +477,38 @@ export async function invoke(
       try {
         response = await deps.sessionManager.invokeOnSession(invokeOpts);
       } catch (invokeErr) {
-        // 7d. Stale session revival: if invokeOnSession throws "Session not found"
-        //     for a non-null session_id, the session died (server restart).
-        //     Try to revive and retry once.
+        // 7d. Stale session revival.
+        //     "Session not found" → not in the in-memory Map.
+        //     "session.*not.*exist|no such session|transcript" → SDK can't
+        //       resume because the on-disk transcript is gone.
+        //     In either case: revive (rehydrate or create) and retry once.
         const errMsg = invokeErr instanceof Error ? invokeErr.message : String(invokeErr);
-        if (/Session not found/i.test(errMsg) && entry.status === 'ready' && entry.declarations) {
-          log.warn('stale session detected, reviving', { target: envelope.target, oldSessionId: sessionId });
-          sessionId = await reviveSession(envelope.target, entry, deps);
-          log.info('session revived, retrying invoke', { target: envelope.target, newSessionId: sessionId });
-          invokeOpts.sessionId = sessionId;
-          response = await deps.sessionManager.invokeOnSession(invokeOpts);
+        const isSessionMissing =
+          /Session not found/i.test(errMsg) ||
+          /session.*not.*exist/i.test(errMsg) ||
+          /no such session/i.test(errMsg) ||
+          /transcript/i.test(errMsg);
+
+        if (isSessionMissing && entry.status === 'ready' && entry.declarations) {
+          const staleId = sessionId;
+          log.warn('stale session detected, reviving', { target: envelope.target, oldSessionId: staleId, error: errMsg });
+          // Force null so reviveSession falls through to create() —
+          // the on-disk transcript may be gone (rehydrate won't help).
+          try {
+            sessionId = await reviveSession(
+              envelope.target,
+              { ...entry, session_id: null },
+              deps,
+            );
+            log.info('session revived, retrying invoke', { target: envelope.target, newSessionId: sessionId });
+            invokeOpts.sessionId = sessionId;
+            response = await deps.sessionManager.invokeOnSession(invokeOpts);
+          } catch (retryErr) {
+            const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+            throw new Error(
+              `SESSION_NOT_AVAILABLE: stale session ${staleId} for ${envelope.target}. Revival failed: ${retryMsg}`,
+            );
+          }
         } else {
           throw invokeErr;
         }

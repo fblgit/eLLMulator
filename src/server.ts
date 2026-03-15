@@ -361,93 +361,100 @@ export function createServer(config: ServerConfig): Server {
   // MCP Server Setup
   // ---------------------------------------------------------------------------
 
-  // External MCP Server (:3100) — 6 tools for human/orchestrator
-  const externalMcp = new McpServer({
-    name: 'ellmulator-external',
-    version: '1.0.0',
-  });
+  // External MCP — per-session factory (same pattern as internal MCP).
+  // Each client (trace CLI, MCP inspector, etc.) gets its own transport+server
+  // pair so multiple clients can connect concurrently.
+  function createExternalSession(): { transport: StreamableHTTPServerTransport; server: McpServer } {
+    const sessionTransport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => crypto.randomUUID(),
+    });
+    const sessionMcp = new McpServer({
+      name: 'ellmulator-external',
+      version: '1.0.0',
+    });
 
-  // Register external tools
-  externalMcp.tool(
-    'trace',
-    'Start a trace scenario through the emulated codebase. Provide a free-form scenario string, or entry_file + function for targeted tracing.',
-    TraceInputSchema.shape,
-    async (args: any) => {
-      // Map schema input to TraceRequest — scenario takes priority over entry_file+function
-      const scenario = args.scenario
-        || (args.function ? `Call ${args.function}(${JSON.stringify(args.params ?? {})})` : 'Trace the codebase');
-      const request = {
-        scenario,
-        entry_point: args.entry_file,
-        state: args.state ?? args.params,
-        max_depth: args.max_depth,
-        mode: args.mode,
-      };
-      const result = await traceHandler(request);
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-      };
-    }
-  );
+    sessionMcp.tool(
+      'trace',
+      'Start a trace scenario through the emulated codebase. Provide a free-form scenario string, or entry_file + function for targeted tracing.',
+      TraceInputSchema.shape,
+      async (args: any) => {
+        const scenario = args.scenario
+          || (args.function ? `Call ${args.function}(${JSON.stringify(args.params ?? {})})` : 'Trace the codebase');
+        const request = {
+          scenario,
+          entry_point: args.entry_file,
+          state: args.state ?? args.params,
+          max_depth: args.max_depth,
+          mode: args.mode,
+        };
+        const result = await traceHandler(request);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+        };
+      }
+    );
 
-  externalMcp.tool(
-    'inspect',
-    'Inspect agent declarations for a specific file',
-    InspectInputSchema.shape,
-    async (args) => {
-      const result = inspectHandler(args.file_path);
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-      };
-    }
-  );
+    sessionMcp.tool(
+      'inspect',
+      'Inspect agent declarations for a specific file',
+      InspectInputSchema.shape,
+      async (args) => {
+        const result = inspectHandler(args.file_path);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+        };
+      }
+    );
 
-  externalMcp.tool(
-    'status',
-    'Get server status and statistics',
-    StatusInputSchema.shape,
-    async () => {
-      const result = statusHandler();
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-      };
-    }
-  );
+    sessionMcp.tool(
+      'status',
+      'Get server status and statistics',
+      StatusInputSchema.shape,
+      async () => {
+        const result = statusHandler();
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+        };
+      }
+    );
 
-  externalMcp.tool(
-    'list_agents',
-    'List all registered agents with optional status filter',
-    ListAgentsInputSchema.shape,
-    async (args) => {
-      const result = listAgentsHandler((args as any).filter_status);
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-      };
-    }
-  );
+    sessionMcp.tool(
+      'list_agents',
+      'List all registered agents with optional status filter',
+      ListAgentsInputSchema.shape,
+      async (args) => {
+        const result = listAgentsHandler((args as any).filter_status);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+        };
+      }
+    );
 
-  externalMcp.tool(
-    'consolidate',
-    'Consolidate findings from a completed trace',
-    ConsolidateInputSchema.shape,
-    async (args) => {
-      const result = await consolidateHandler({ reBootstrap: false });
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-      };
-    }
-  );
+    sessionMcp.tool(
+      'consolidate',
+      'Consolidate findings from a completed trace',
+      ConsolidateInputSchema.shape,
+      async () => {
+        const result = await consolidateHandler({ reBootstrap: false });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+        };
+      }
+    );
 
-  externalMcp.tool(
-    'starmap',
-    'Generate dependency graph (Phase 4 — returns empty for now)',
-    StarmapInputSchema.shape,
-    async () => {
-      return {
-        content: [{ type: 'text', text: JSON.stringify({}, null, 2) }],
-      };
-    }
-  );
+    sessionMcp.tool(
+      'starmap',
+      'Generate dependency graph (Phase 4 — returns empty for now)',
+      StarmapInputSchema.shape,
+      async () => {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({}, null, 2) }],
+        };
+      }
+    );
+
+    return { transport: sessionTransport, server: sessionMcp };
+  }
 
   // Internal MCP tools are registered per-session in createInternalSession() below.
   // The MCP SDK's StreamableHTTPServerTransport is single-session: after the first
@@ -488,11 +495,10 @@ export function createServer(config: ServerConfig): Server {
       running = true;
       log.info('server starting', { extPort: resolved.extPort, intPort: resolved.intPort });
 
-      // Create external HTTP server
-      const externalTransport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => crypto.randomUUID(),
-      });
-      await externalMcp.connect(externalTransport);
+      // Create external HTTP server — per-session transport pattern.
+      // Same approach as internal MCP: each client gets its own transport+server
+      // so the trace CLI, MCP inspector, etc. can all connect concurrently.
+      const externalSessions = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer }>();
 
       externalHttpServer = createHttpServer(async (req, res) => {
         if (req.url !== '/mcp') {
@@ -502,15 +508,40 @@ export function createServer(config: ServerConfig): Server {
         }
 
         try {
+          const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
           if (req.method === 'POST') {
             const body = await readBody(req);
-            await externalTransport.handleRequest(req, res, JSON.parse(body));
-          } else if (req.method === 'GET' || req.method === 'DELETE') {
-            // GET = SSE stream, DELETE = session termination
-            await externalTransport.handleRequest(req, res);
-          } else {
-            res.writeHead(405);
+            const parsed = JSON.parse(body);
+
+            // Existing session — route to its transport
+            if (sessionId && externalSessions.has(sessionId)) {
+              const session = externalSessions.get(sessionId)!;
+              await session.transport.handleRequest(req, res, parsed);
+              return;
+            }
+
+            // New session — create fresh transport+server
+            const session = createExternalSession();
+            await session.server.connect(session.transport);
+
+            await session.transport.handleRequest(req, res, parsed);
+
+            if (session.transport.sessionId) {
+              externalSessions.set(session.transport.sessionId, session);
+              session.transport.onclose = () => {
+                externalSessions.delete(session.transport.sessionId!);
+              };
+            }
+          } else if ((req.method === 'GET' || req.method === 'DELETE') && sessionId && externalSessions.has(sessionId)) {
+            const session = externalSessions.get(sessionId)!;
+            await session.transport.handleRequest(req, res);
+          } else if (req.method === 'DELETE') {
+            res.writeHead(204);
             res.end();
+          } else {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: 'Bad Request: missing session ID' }));
           }
         } catch (error) {
           if (!res.headersSent) {

@@ -8,6 +8,8 @@ eLLMulator takes a different approach: LLM agents *become* your software compone
 
 **The core insight:** MCP tool calls are synchronous from the caller's perspective — that *is* the invoke primitive. No custom agent framework needed. The [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) provides sessions, MCP provides the bus. The code itself is the routing layer.
 
+![eLLMulator](assets/eLLMulator.png)
+
 ---
 
 ## Features
@@ -24,6 +26,12 @@ eLLMulator takes a different approach: LLM agents *become* your software compone
 - **OpenTelemetry export** — fire-and-forget OTLP span export to any collector (Jaeger, Tempo, Honeycomb)
 - **Project onboarding** — `ellmulator init` idempotently wires MCP, permissions, and docs into any project
 - **Dual MCP surface** — external tools for users, internal tools for agent-to-agent communication
+
+## Next Steps
+
+- **More Agent Frameworks** - to support opencode, codex, and other popular suites
+- **Smaller Agents Support** - optimize further the speed of the tracing
+- **eLLMulator Skill** - so agents can make advanced and efficient testing and troubleshooting
 
 ## Architecture
 
@@ -76,6 +84,9 @@ npm run build
 # Configure
 echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
 
+# Init the eLLMulator (Setup the mcp configuration and prompt)
+npx ellmulator init /path/to/your/app
+
 # Bootstrap + start server
 npx ellmulator start --project /path/to/your/app --bootstrap
 
@@ -86,7 +97,7 @@ npx ellmulator trace "What happens when a user submits an order?" \
 ```
 
 > 📖 See **[QUICKSTART.md](./QUICKSTART.md)** for a detailed step-by-step guide.
-
+ 
 ## How It Works
 
 ### 1. Scan
@@ -130,7 +141,9 @@ After the trace completes, five analyzers examine the trace entries:
 | **Missing Error Path** | Error responses with no caller error handling |
 | **Assumption Bug** | Mismatches between `expected_output` and actual results |
 
-The `TraceResult` includes all entries, findings, an LLM-enriched summary, and duration.
+The `TraceResult` includes all entries, findings, an LLM-enriched summary, and duration. Or via OTEL with your usual distributed tracing suite, like Jaeger:
+
+![OTEL Trace](assets/OTEL.png)
 
 ## CLI Reference
 
@@ -417,6 +430,15 @@ See **[QUICKSTART.md](./QUICKSTART.md)** section 8 for the full walkthrough.
 5. Ensure TypeScript compiles: `npm run build`
 6. Submit a pull request
 
-## License
-
-TBD
+## Citation
+Rember to cite the author if you get inspired and motivated by this concept:
+```
+@misc{eLLMulator,
+  author = {Xavier Murias},
+  title = {eLLMulator: Agentic Distributed Trace Simulation — LLM agents as software components},
+  year = {2026},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/fblgit/eLLMulator}},
+}
+```

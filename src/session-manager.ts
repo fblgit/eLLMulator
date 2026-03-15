@@ -60,6 +60,16 @@ type CreateOptions = {
   onMessage?: (msg: { type: string; subtype?: string; content?: unknown }) => void;
 };
 
+type RehydrateOptions = {
+  sessionId: string;
+  filePath: string;
+  fileHash: string;
+  systemPrompt: string;
+  tools: string[];
+  model: string;
+  maxBudgetUsd?: number;
+};
+
 type InvokeOptions = {
   sessionId: string;
   prompt: string;
@@ -214,6 +224,50 @@ export class SessionManager {
       abortController.abort();
       throw error;
     }
+  }
+
+  /**
+   * Rehydrate a persisted session into the in-memory map WITHOUT an API call.
+   *
+   * The SDK persists session transcripts to ~/.claude/projects/ by default.
+   * After a server restart, we already have the session_id from SQLite —
+   * we just need to register it in the in-memory Map so invokeOnSession()
+   * can use `resume: sessionId` (+ `forkSession: true`) to reconnect
+   * to the existing conversation on disk.
+   *
+   * This replaces the old warm-up pattern that called create() (a full
+   * query() API call per agent) just to get a session_id into the Map.
+   */
+  rehydrate(opts: RehydrateOptions): AgentSession {
+    // Don't overwrite a live session
+    const existing = this.sessions.get(opts.sessionId);
+    if (existing && existing.status !== 'terminated') {
+      log.info('session already live, skipping rehydrate', { sessionId: opts.sessionId });
+      return existing;
+    }
+
+    const abortController = new AbortController();
+
+    const session: AgentSession = {
+      session_id: opts.sessionId,
+      file_path: opts.filePath,
+      created_at: new Date(),
+      file_hash: opts.fileHash,
+      status: 'idle',
+      systemPrompt: opts.systemPrompt,
+      tools: opts.tools,
+      model: opts.model,
+      abortController,
+      includePartialMessages: true,
+      cumulativeCostUsd: 0,
+      ...(opts.maxBudgetUsd !== undefined && { maxBudgetUsd: opts.maxBudgetUsd }),
+    };
+
+    this.sessions.set(opts.sessionId, session);
+    this.abortControllers.set(opts.sessionId, abortController);
+
+    log.info('session rehydrated (no API call)', { file: opts.filePath, sessionId: opts.sessionId });
+    return session;
   }
 
   /**

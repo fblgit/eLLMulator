@@ -567,86 +567,58 @@ export async function main(argv: string[]): Promise<void> {
         // immediately after each session_id is set, surviving Ctrl+C.
       }
 
-      // Warm up sessions for ready entries that don't have live sessions.
-      // This handles the common case: files were bootstrapped in a previous run
-      // (declarations in SQLite) but the SessionManager is fresh (no live sessions).
-      // Without this, every invoke triggers on-demand revival.
+      // Rehydrate sessions for ready entries that have persisted session_ids.
+      // SDK transcripts live on disk (~/.claude/projects/) and survive process
+      // restarts.  We just register the session_id in the in-memory Map so
+      // invokeOnSession() can use `resume + forkSession` natively — zero API calls.
+      //
+      // Entries without a session_id (persistence gap: upsert fired before
+      // bootstrap set it) are skipped; invoke() handles them on-demand.
       {
         const registry = server.getRegistry();
         const allEntries = registry.list();
-        const readyEntries = allEntries.filter(e =>
-          e.status === 'ready' && (!e.session_id || !sm.get(e.session_id))
+        const rehydratable = allEntries.filter(e =>
+          e.status === 'ready' && e.session_id && !sm.get(e.session_id)
         );
 
-        if (readyEntries.length > 0) {
-          log.info('warming up sessions for ready entries', { count: readyEntries.length, threads: config.threads });
-          const warmupStart = Date.now();
+        if (rehydratable.length > 0) {
+          log.info('rehydrating sessions from persistence', { count: rehydratable.length });
+          let rehydrated = 0;
 
-          // Bounded concurrency warm-up — same pattern as bootstrap
-          const warmupExecuting: Promise<void>[] = [];
-          let warmedUp = 0;
+          for (const entry of rehydratable) {
+            try {
+              const systemPrompt = renderSystemPrompt({
+                filePath: entry.file_path,
+                sourceCode: '',
+              });
 
-          for (const entry of readyEntries) {
-            const p = (async () => {
-              try {
-                const systemPrompt = renderSystemPrompt({
-                  filePath: entry.file_path,
-                  sourceCode: '',  // source is read by agent via cat -n, not embedded
-                });
+              sm.rehydrate({
+                sessionId: entry.session_id!,
+                filePath: entry.file_path,
+                fileHash: entry.file_hash,
+                systemPrompt,
+                tools: ['mcp__internal__register'],
+                model: config.model,
+              });
 
-                const session = await sm.create({
-                  filePath: entry.file_path,
-                  fileHash: entry.file_hash,
-                  systemPrompt,
-                  bootstrapPrompt: 'Your declarations are already registered. You are ready for trace tasks. Respond with "ready" and stop.',
-                  cwd: config.project,
-                  tools: ['mcp__internal__register'],
-                  mcpServers: {
-                    'internal': { type: 'http', url: `http://127.0.0.1:${config.intPort}/mcp` },
-                  },
-                  disallowedTools: ['Agent', 'Task', 'Write', 'Edit', 'Read'],
-                  model: config.model,
-                });
-
-                registry.update(entry.file_path, { session_id: session.session_id });
-                const persistence = server.getPersistence();
-                if (persistence) {
-                  const updated = registry.get(entry.file_path);
-                  if (updated) {
-                    persistence.upsertAgent({
-                      file_path: updated.file_path,
-                      file_hash: updated.file_hash,
-                      status: updated.status,
-                      session_id: updated.session_id ?? undefined,
-                      declarations: updated.declarations ?? undefined,
-                      last_active: updated.last_active ?? undefined,
-                      error: updated.error ?? undefined,
-                    });
-                  }
-                }
-                warmedUp++;
-                log.info('session warmed up', { file: entry.file_path, sessionId: session.session_id, progress: `${warmedUp}/${readyEntries.length}` });
-              } catch (err) {
-                log.error('session warm-up failed', { file: entry.file_path, error: err instanceof Error ? err.message : String(err) });
-              }
-            })();
-
-            warmupExecuting.push(p.then(() => { warmupExecuting.splice(warmupExecuting.indexOf(p), 1); }));
-            if (warmupExecuting.length >= config.threads) {
-              await Promise.race(warmupExecuting);
+              rehydrated++;
+            } catch (err) {
+              log.error('session rehydration failed', { file: entry.file_path, error: err instanceof Error ? err.message : String(err) });
             }
           }
-          await Promise.all(warmupExecuting);
 
-          const warmupElapsed = ((Date.now() - warmupStart) / 1000).toFixed(1);
-          log.info('session warm-up complete', { warmedUp, total: readyEntries.length, elapsed: `${warmupElapsed}s` });
+          log.info('session rehydration complete', { rehydrated, total: rehydratable.length });
         }
       }
 
-      // Keep-alive: install signal handlers to keep process running
+      // Keep the event loop alive — HTTP servers alone may not suffice when
+      // SDK child processes drain during bootstrap/warmup.
+      const keepAlive = setInterval(() => {}, 30_000);
+
       log.info('server running, press Ctrl+C to stop');
       const shutdown = async () => {
         log.info('shutting down');
+        clearInterval(keepAlive);
         await server.stop();
         process.exit(0);
       };

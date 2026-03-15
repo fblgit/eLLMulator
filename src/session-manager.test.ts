@@ -680,4 +680,117 @@ describe('SessionManager — Real SDK Integration', () => {
       expect(Array.isArray(result)).toBe(true);
     });
   });
+
+  // ─── Test: rehydrate() — zero-cost session registration ───
+
+  describe('rehydrate() — zero-cost session registration', () => {
+    it('should register a session in the map without any API call', () => {
+      const session = manager.rehydrate({
+        sessionId: 'persisted-session-abc',
+        filePath: '/src/server.ts',
+        fileHash: 'hash-abc',
+        systemPrompt: 'You ARE /src/server.ts',
+        tools: ['mcp__internal__register'],
+        model: 'claude-sonnet-4-6',
+      });
+
+      expect(session.session_id).toBe('persisted-session-abc');
+      expect(session.file_path).toBe('/src/server.ts');
+      expect(session.status).toBe('idle');
+      expect(session.cumulativeCostUsd).toBe(0);
+      // Verify it's in the map
+      expect(manager.get('persisted-session-abc')).toBe(session);
+      // No SDK query() call should have been made
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    it('should be listed as an active session', () => {
+      manager.rehydrate({
+        sessionId: 'rehydrated-1',
+        filePath: '/src/a.ts',
+        fileHash: 'hash-a',
+        systemPrompt: 'Test',
+        tools: [],
+        model: 'opus',
+      });
+
+      const sessions = manager.list();
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0].session_id).toBe('rehydrated-1');
+    });
+
+    it('should not overwrite a live session', async () => {
+      // Create a live session first
+      const createMessages: SDKMessage[] = [
+        { type: 'system', subtype: 'init', session_id: 'live-session-1' } as SDKMessage,
+        { type: 'result', subtype: 'success', is_error: false, session_id: 'live-session-1' } as SDKMessage,
+      ];
+      mockQuery.mockReturnValue(createMockQueryGenerator(createMessages));
+
+      const created = await manager.create({
+        filePath: '/src/server.ts',
+        fileHash: 'hash-1',
+        systemPrompt: 'Test',
+        bootstrapPrompt: 'Bootstrap',
+        tools: [],
+        model: 'opus',
+        cwd: '/test',
+      });
+      expect(created.status).toBe('active');
+
+      // Try to rehydrate same session_id — should return existing
+      const rehydrated = manager.rehydrate({
+        sessionId: 'live-session-1',
+        filePath: '/src/server.ts',
+        fileHash: 'hash-1',
+        systemPrompt: 'Test',
+        tools: [],
+        model: 'opus',
+      });
+
+      expect(rehydrated).toBe(created);
+      expect(rehydrated.status).toBe('active'); // not overwritten to 'idle'
+    });
+
+    it('should be usable by invokeOnSession with resume', () => {
+      const session = manager.rehydrate({
+        sessionId: 'resumable-session',
+        filePath: '/src/handler.ts',
+        fileHash: 'hash-handler',
+        systemPrompt: 'You ARE /src/handler.ts',
+        tools: ['mcp__internal__invoke'],
+        model: 'claude-sonnet-4-6',
+      });
+
+      // Session is in the map and not terminated — invokeOnSession should
+      // find it and attempt SDK query with resume: sessionId
+      expect(manager.get('resumable-session')).toBeDefined();
+      expect(session.status).not.toBe('terminated');
+    });
+
+    it('should support budget tracking', () => {
+      const session = manager.rehydrate({
+        sessionId: 'budget-session',
+        filePath: '/src/expensive.ts',
+        fileHash: 'hash-exp',
+        systemPrompt: 'Test',
+        tools: [],
+        model: 'opus',
+        maxBudgetUsd: 1.00,
+      });
+
+      expect(session.maxBudgetUsd).toBe(1.00);
+      expect(session.cumulativeCostUsd).toBe(0);
+
+      manager.recordCost('budget-session', 0.50);
+      expect(session.cumulativeCostUsd).toBe(0.50);
+
+      // Should not throw yet
+      manager.checkBudget('budget-session');
+
+      manager.recordCost('budget-session', 0.60);
+      // Now over budget
+      expect(() => manager.checkBudget('budget-session')).toThrow(/BUDGET_EXCEEDED/);
+    });
+  });
 });
